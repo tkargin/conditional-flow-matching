@@ -63,3 +63,5 @@ def plot_trajectories(traj):
     plt.xticks([])
     plt.yticks([])
     plt.show()
+
+
