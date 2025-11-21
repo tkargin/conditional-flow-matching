@@ -4,6 +4,9 @@ import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
 
+
+__all__ = ["plot_time_series", "plot_state_space", "plot_block_weight_heatmaps"]
+
 ##########################
 # Plotting functions
 ##########################
@@ -116,7 +119,7 @@ def plot_time_series(
     if handles:
         fig.axes[0].legend(loc="best")
     plt.tight_layout()
-    plt.show()
+    return fig
 
 
 def plot_state_space(
@@ -198,6 +201,7 @@ def plot_state_space(
 
     ax.set_xlabel(f"x_{dims[0]+1}")
     ax.set_ylabel(f"x_{dims[1]+1}")
+
     if len(dims) == 3:
         ax.set_zlabel(f"x_{dims[2]+1}")
     ax.set_title("State-space trajectories")
@@ -205,9 +209,108 @@ def plot_state_space(
     if len(dims) == 2:
         ax.legend(loc="best")
     plt.tight_layout()
-    plt.show()
+    return fig
 
 
+def plot_block_weight_heatmaps(
+    model,
+    mode="block",
+    include_shared=False,
+    cmap="magma",
+    annotate=False,
+    norm="fro",
+):
+    """
+    Visualize masked weights as heatmaps.
+
+    Parameters
+    ----------
+    model : MaskedBlockMLP
+    mode : {"block", "full"}
+        "block" shows T×T block magnitudes. "full" ignores block structure and plots
+        each weight entry. Masked connections appear in black.
+    include_shared : bool
+        Include shared blocks when computing block magnitudes.
+    """
+    layers = getattr(model, "layers", None)
+    layouts = getattr(model, "_block_layouts", None)
+    if layers is None or layouts is None:
+        raise TypeError("Model must expose .layers and _block_layouts (MaskedBlockMLP).")
+
+    n_layers = len(layers)
+    fig, axes = plt.subplots(1, n_layers, figsize=(4 * n_layers, 4), squeeze=False)
+
+    if mode == "block":
+        block_vals = []
+        block_masks = []
+        for layer, layout in zip(layers, layouts):
+            in_blocks = list(layout["in_blocks"])
+            if include_shared and layout["shared_block"]:
+                in_blocks += list(layout["shared_block"])
+            out_blocks = list(layout["out_blocks"])
+            weight = layer.weight.detach()
+            mask = layer.mask.detach()
+            block_arr = torch.zeros(len(out_blocks), len(in_blocks))
+            block_mask = torch.zeros(len(out_blocks), len(in_blocks))
+            row_start = 0
+            for r, out_dim in enumerate(out_blocks):
+                col_start = 0
+                for c, in_dim in enumerate(in_blocks):
+                    w_block = weight[row_start:row_start + out_dim, col_start:col_start + in_dim]
+                    m_block = mask[row_start:row_start + out_dim, col_start:col_start + in_dim]
+                    if norm == "fro":
+                        val = torch.linalg.norm(w_block, ord="fro")
+                    elif norm == "absmax":
+                        val = w_block.abs().max()
+                    elif norm == "l1":
+                        val = w_block.abs().sum()
+                    else:
+                        raise ValueError(f"Unsupported norm '{norm}'.")
+                    block_arr[r, c] = val
+                    block_mask[r, c] = float(m_block.any())
+                    col_start += in_dim
+                row_start += out_dim
+            block_vals.append(block_arr.cpu().numpy())
+            block_masks.append(block_mask.cpu().numpy())
+        cmap_obj = plt.get_cmap(cmap).copy()
+        cmap_obj.set_bad(color="black")
+        for idx, (ax, arr, mask_arr) in enumerate(zip(axes[0], block_vals, block_masks)):
+            vmax = arr.max() if arr.size else 1.0
+            display = arr.copy()
+            display[mask_arr == 0] = np.nan
+            im = ax.imshow(display, cmap=cmap_obj, vmin=0.0, vmax=vmax, aspect="equal")
+            ax.set_title(f"Layer {idx + 1}")
+            ax.set_xlabel("Input blocks")
+            ax.set_ylabel("Output blocks")
+            if annotate:
+                for i in range(arr.shape[0]):
+                    for j in range(arr.shape[1]):
+                        ax.text(j, i, f"{arr[i, j]:.2f}", ha="center", va="center", color="white", fontsize=8)
+    elif mode == "full":
+        processed = []
+        for layer in layers:
+            weight = layer.weight.detach().cpu().numpy()
+            mask = layer.mask.detach().cpu().numpy()
+            arr = np.abs(weight)
+            processed.append((arr, mask))
+        cmap_obj = plt.get_cmap(cmap).copy()
+        cmap_obj.set_bad(color="black")
+        for idx, (ax, (arr, mask)) in enumerate(zip(axes[0], processed)):
+            vmax = arr.max() if arr.size else 1.0
+            display = arr.copy()
+            display[mask == 0] = np.nan
+            im = ax.imshow(display, cmap=cmap_obj, vmin=0.0, vmax=vmax, aspect="equal")
+            ax.set_title(f"Layer {idx + 1}")
+            ax.set_xlabel("Input neurons")
+            ax.set_ylabel("Output neurons")
+    else:
+        raise ValueError("mode must be 'block' or 'full'")
+
+    cbar = fig.colorbar(im, ax=axes.ravel().tolist(), fraction=0.025, pad=0.04)
+    cbar.set_label("Magnitude")
+    fig.suptitle("Masked weight heatmaps")
+    fig.tight_layout()
+    return fig
 
 
 
@@ -283,7 +386,3 @@ def plot_state_space(
 #     ax.set_title(f"{n_show} sample trajectories in ℝ^{d} (projected)")
 #     ax.grid(True, alpha=0.3)
 #     plt.show()
-
-
-
-

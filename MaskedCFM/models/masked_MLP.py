@@ -4,6 +4,8 @@ import torch
 import torch.nn as nn
 from torch.nn.utils import parametrize
 
+__all__ = ["BlockLowerTriangularMask", "MaskedLinear", "MaskedBlockMLP"]
+
 def BlockLowerTriangularMask(in_T, out_sizes, shared=None, device=None):
     """Create a block lower-triangular mask for MaskedLinear layer.
     Args:
@@ -96,6 +98,7 @@ class MaskedBlockMLP(nn.Module):
         layer_out_blocks = [[width] * T for width in hidden] + [[out_dim] * T]
 
         layers = []
+        self._block_layouts = []
         for idx, (in_blocks, out_blocks) in enumerate(zip(layer_in_blocks, layer_out_blocks)):
             shared_block = first_shared if (idx == 0 and time_varying) else []
             linear = MaskedLinear(sum(in_blocks) + sum(shared_block), sum(out_blocks))
@@ -105,6 +108,11 @@ class MaskedBlockMLP(nn.Module):
                 )
                 linear.set_mask(mask)
             layers.append(linear)
+            self._block_layouts.append({
+                "in_blocks": list(in_blocks),
+                "shared_block": list(shared_block),
+                "out_blocks": list(out_blocks),
+            })
         
         self.layers = nn.ModuleList(layers)
         self.act = activation() if activation is not None else nn.Identity()
@@ -132,3 +140,32 @@ class MaskedBlockMLP(nn.Module):
         if self.flatten_output:
             return y  # shape (B, T*out_dim) → identical to original MLP interface
         return y.view(xt.size(0), self.T, -1)
+
+    def block_weight_magnitudes(self, norm="fro", include_shared=False):
+        """Return per-block weight magnitudes for each masked layer."""
+        magnitudes = []
+        for layer, layout in zip(self.layers, self._block_layouts):
+            in_blocks = list(layout["in_blocks"])
+            if include_shared and layout["shared_block"]:
+                in_blocks = in_blocks + list(layout["shared_block"])
+            out_blocks = list(layout["out_blocks"])
+            weight = layer.weight.detach()
+            block_vals = torch.zeros(len(out_blocks), len(in_blocks))
+            row_start = 0
+            for r, out_dim in enumerate(out_blocks):
+                col_start = 0
+                for c, in_dim in enumerate(in_blocks):
+                    block = weight[row_start:row_start + out_dim, col_start:col_start + in_dim]
+                    if norm == "fro":
+                        val = torch.linalg.norm(block, ord="fro")
+                    elif norm == "absmax":
+                        val = block.abs().max()
+                    elif norm == "l1":
+                        val = block.abs().sum()
+                    else:
+                        raise ValueError(f"Unsupported norm '{norm}'.")
+                    block_vals[r, c] = val
+                    col_start += in_dim
+                row_start += out_dim
+            magnitudes.append(block_vals.cpu().numpy())
+        return magnitudes
