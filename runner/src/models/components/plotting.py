@@ -6,6 +6,8 @@ import numpy as np
 import scprep
 import torch
 
+from ..models.masked_MLP import BlockLowerTriLinear
+
 
 def plot_scatter(obs, model, title="fig", wandb_logger=None):
     fig, ax = plt.subplots(1, 1, figsize=(5, 5))

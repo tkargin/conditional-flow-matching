@@ -4,7 +4,12 @@ import torch
 import torch.nn as nn
 from torch.nn.utils import parametrize
 
-__all__ = ["BlockLowerTriangularMask", "MaskedLinear", "MaskedBlockMLP"]
+__all__ = [
+    "BlockLowerTriangularMask",
+    "MaskedLinear",
+    "MaskedBlockMLP",
+    "BlockLowerTriLinear",
+]
 
 def BlockLowerTriangularMask(in_T, out_sizes, shared=None, device=None):
     """Create a block lower-triangular mask for MaskedLinear layer.
@@ -66,6 +71,104 @@ class MaskedLinear(nn.Linear):
         return nn.functional.linear(x, self.weight, self.bias)
 
 
+class BlockLowerTriLinear(nn.Module):
+    """
+    Block lower-triangular linear transformation with optional shared (always-connected)
+    input blocks. Only blocks on or below the block diagonal (plus shared columns) have
+    trainable parameters; upper blocks are implicitly zero.
+
+    Example
+    -------
+    >>> layer = BlockLowerTriLinear(
+    ...     out_blocks=[d1, d2, d3],
+    ...     in_blocks=[d1, d2, d3],
+    ...     shared_blocks=[1],  # e.g., time feature
+    ... )
+    >>> x = torch.randn(batch, sum(in_blocks) + sum(shared_blocks))
+    >>> y = layer(x)
+
+    Parameters
+    ----------
+    out_blocks : list[int]
+        Output block sizes (one per time step).
+    in_blocks : list[int]
+        Input block sizes matched to out_blocks (one per time step).
+    shared_blocks : list[int], optional
+        Additional input block sizes that connect to every output block.
+    bias : bool
+        Whether to include a bias term per output unit.
+    """
+
+    def __init__(self, out_blocks, in_blocks, shared_blocks=None, bias=True, init_mode="zero"):
+        super().__init__()
+        self.out_blocks = list(map(int, out_blocks))
+        self.in_blocks = list(map(int, in_blocks))
+        self.shared_blocks = list(map(int, shared_blocks or []))
+        self.init_mode = init_mode
+        if len(self.out_blocks) != len(self.in_blocks):
+            raise ValueError("out_blocks and in_blocks must have the same length.")
+
+        self.num_main = len(self.out_blocks)
+        self.all_in_block = self.in_blocks + self.shared_blocks
+
+        self.row_offsets = np.cumsum([0] + self.out_blocks).tolist()
+        self.col_offsets = np.cumsum([0] + self.all_in_block).tolist()
+
+        self._block_meta = []
+        params = []
+        # lower-triangular blocks
+        for i in range(self.num_main):
+            for j in range(self.num_main):
+                if i >= j:
+                    self._block_meta.append((i, j))
+                    params.append(self._make_block(self.out_blocks[i], self.in_blocks[j]))
+        # shared blocks (always connected)
+        for i in range(self.num_main):
+            for s, size in enumerate(self.shared_blocks):
+                col_idx = self.num_main + s
+                self._block_meta.append((i, col_idx))
+                params.append(self._make_block(self.out_blocks[i], size))
+
+        self.blocks = nn.ParameterList(params)
+        self.bias = nn.Parameter(torch.zeros(sum(self.out_blocks))) if bias else None
+
+    def _make_block(self, rows, cols):
+        block = nn.Parameter(torch.zeros(rows, cols))
+        self._init_block(block)
+        return block
+
+    def _init_block(self, block):
+        if self.init_mode == "xavier":
+            nn.init.xavier_uniform_(block)
+        elif self.init_mode == "normal":
+            nn.init.normal_(block, mean=0.0, std=0.02)
+        else:
+            block.data.zero_()
+
+    def assemble_weight(self, device=None, dtype=None):
+        device = device or self.blocks[0].device
+        dtype = dtype or self.blocks[0].dtype
+        total_rows = sum(self.out_blocks)
+        total_cols = sum(self.all_in_block)
+        weight = torch.zeros(total_rows, total_cols, device=device, dtype=dtype)
+        
+        for block, (i, j) in zip(self.blocks, self._block_meta):
+            r0, r1 = self.row_offsets[i], self.row_offsets[i + 1]
+            c0, c1 = self.col_offsets[j], self.col_offsets[j + 1]
+            weight[r0:r1, c0:c1] = block
+            
+        return weight
+
+    def forward(self, x):
+        expected = sum(self.all_in_block)
+        if x.shape[-1] != expected:
+            raise ValueError(f"Expected input dim {expected}, got {x.shape[-1]}.")
+        W = self.assemble_weight(device=x.device, dtype=x.dtype)
+        y = x @ W.T
+        if self.bias is not None:
+            y = y + self.bias
+        return y
+
 
 # Masked MLP with block lower-triangular masking
 class MaskedBlockMLP(nn.Module):
@@ -82,13 +185,17 @@ class MaskedBlockMLP(nn.Module):
         flatten_output: if True, flatten output to (B, T*out_dim)
     '''
     def __init__(self, T, in_dim, out_dim, hidden_per_t=(64,64), 
-                 activation=nn.SELU, causal=False, debugMode=False, time_varying=False, flatten_output=True):
+                 activation=nn.SELU, causal=False, debugMode=False, time_varying=False,
+                 flatten_output=True, block_init="zero", use_batch_norm=False):
         super().__init__()
         self.T = T
         self.in_dim = in_dim
         self.debugMode = debugMode
         self.time_varying = time_varying
         self.flatten_output = flatten_output
+        self.block_init = block_init
+        self._activation_cls = activation
+        self.use_batch_norm = use_batch_norm
         
         hidden = list(hidden_per_t)
         layer_in_blocks = [[in_dim] * T]
@@ -101,13 +208,17 @@ class MaskedBlockMLP(nn.Module):
         self._block_layouts = []
         for idx, (in_blocks, out_blocks) in enumerate(zip(layer_in_blocks, layer_out_blocks)):
             shared_block = first_shared if (idx == 0 and time_varying) else []
-            linear = MaskedLinear(sum(in_blocks) + sum(shared_block), sum(out_blocks))
             if causal:
-                mask = BlockLowerTriangularMask(
-                    in_blocks, out_blocks, shared=shared_block, device=linear.weight.device
+                layer = BlockLowerTriLinear(
+                    out_blocks=out_blocks,
+                    in_blocks=list(in_blocks),
+                    shared_blocks=list(shared_block),
+                    bias=True,
+                    init_mode=block_init,
                 )
-                linear.set_mask(mask)
-            layers.append(linear)
+            else:
+                layer = MaskedLinear(sum(in_blocks) + sum(shared_block), sum(out_blocks))
+            layers.append(layer)
             self._block_layouts.append({
                 "in_blocks": list(in_blocks),
                 "shared_block": list(shared_block),
@@ -115,7 +226,31 @@ class MaskedBlockMLP(nn.Module):
             })
         
         self.layers = nn.ModuleList(layers)
+        self.bn_layers = None
+        if self.use_batch_norm:
+            # batch norm for all hidden layers (exclude final output layer)
+            hidden_dims = [sum(out_blocks) for out_blocks in layer_out_blocks[:-1]]
+            self.bn_layers = nn.ModuleList([nn.BatchNorm1d(dim) for dim in hidden_dims])
         self.act = activation() if activation is not None else nn.Identity()
+        self._init_config = {
+            "T": T,
+            "in_dim": in_dim,
+            "out_dim": out_dim,
+            "hidden_per_t": tuple(hidden_per_t),
+            "activation": None if activation is None else {
+                "module": activation.__module__,
+                "class": activation.__name__,
+            },
+            "causal": causal,
+            "debugMode": debugMode,
+            "time_varying": time_varying,
+            "flatten_output": flatten_output,
+            "block_init": block_init,
+            "use_batch_norm": use_batch_norm,
+        }
+
+    def _apply_layer(self, layer, x):
+        return layer(x)
     
     def forward(self, xt):
         # Accept (B, T, in_dim) or flattened (B, T*in_dim [+ time])
@@ -133,9 +268,12 @@ class MaskedBlockMLP(nn.Module):
 
         h = torch.cat([x_flat, t_feat], dim=-1) if t_feat is not None else x_flat
 
-        for layer in self.layers[:-1]:
-            h = self.act(layer(h))
-        y = self.layers[-1](h)
+        for idx, layer in enumerate(self.layers[:-1]):
+            h = self._apply_layer(layer, h)
+            if self.use_batch_norm:
+                h = self.bn_layers[idx](h)
+            h = self.act(h)
+        y = self._apply_layer(self.layers[-1], h)
 
         if self.flatten_output:
             return y  # shape (B, T*out_dim) → identical to original MLP interface
@@ -149,7 +287,10 @@ class MaskedBlockMLP(nn.Module):
             if include_shared and layout["shared_block"]:
                 in_blocks = in_blocks + list(layout["shared_block"])
             out_blocks = list(layout["out_blocks"])
-            weight = layer.weight.detach()
+            if isinstance(layer, BlockLowerTriLinear):
+                weight = layer.assemble_weight().detach()
+            else:
+                weight = layer.weight.detach()
             block_vals = torch.zeros(len(out_blocks), len(in_blocks))
             row_start = 0
             for r, out_dim in enumerate(out_blocks):
@@ -169,3 +310,11 @@ class MaskedBlockMLP(nn.Module):
                 row_start += out_dim
             magnitudes.append(block_vals.cpu().numpy())
         return magnitudes
+
+    def to_config(self):
+        config = {
+            "module": self.__class__.__module__,
+            "class": self.__class__.__name__,
+            "kwargs": dict(self._init_config),
+        }
+        return config

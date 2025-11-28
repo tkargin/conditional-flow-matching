@@ -1,5 +1,5 @@
 import abc
-import torch
+#import torch
 
 class Sampler(abc.ABC):
     """Abstract base class for all samplers/generators."""

@@ -1,10 +1,62 @@
 import torch
 import torch.nn as nn
-from typing import Callable, Optional, Dict, Any
+from dataclasses import dataclass
+from typing import List, Callable, Optional, Dict, Any
 
 
-__all__ = ["CFMModelBundle"]
+__all__ = ["build_bundle","CFMModelBundle", "ModelSpec", "serialize_model_specs"]
 
+
+def _callable_to_dict(fn: Callable) -> Dict[str, str]:
+    return {
+        "module": fn.__module__,
+        "qualname": getattr(fn, "__qualname__", fn.__name__),
+        "name": getattr(fn, "__name__", repr(fn)),
+    }
+
+
+def _class_to_dict(obj: Any, extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    data = {
+        "module": obj.__class__.__module__,
+        "class": obj.__class__.__name__,
+    }
+    if extra:
+        data.update(extra)
+    return data
+
+
+def _serialize_sampler(sampler) -> Dict[str, Any]:
+    payload = _class_to_dict(sampler)
+    if hasattr(sampler, "state_dict"):
+        payload["state"] = sampler.state_dict()
+    return payload
+
+
+@dataclass
+class ModelSpec:
+    name: str
+    long_name: str
+    bundle: 'CFMModelBundle'
+    train_history: List[Dict[str, Any]]
+    val_history: List[Dict[str, Any]]
+    checkpoints: List[Dict[str, Any]]
+
+def build_bundle(name: str, long_name: str, bundle: 'CFMModelBundle'):
+    return ModelSpec(name=name, long_name=long_name, bundle=bundle, train_history=[],  val_history=[],  checkpoints = [])
+
+
+def serialize_model_specs(specs: List[ModelSpec]) -> List[Dict[str, Any]]:
+    serialized = []
+    for spec in specs:
+        serialized.append({
+            "name": spec.name,
+            "long_name": spec.long_name,
+            "bundle": spec.bundle.to_serializable(),
+            "train_history": spec.train_history,
+            "val_history": spec.val_history,
+            "checkpoints": spec.checkpoints,
+        })
+    return serialized
 
 class CFMModelBundle:
     """
@@ -38,7 +90,17 @@ class CFMModelBundle:
         target_sampler=None,
         joint_sampler=None,
         ode_factory: Optional[Callable[[nn.Module], Any]] = None,
+        loss_fn: Callable = nn.MSELoss(),
+        optimizer: Optional[torch.optim.Optimizer] = None,
+        optimizer_factory: Optional[Callable[[nn.Module], torch.optim.Optimizer]] = None,
         device="cpu",
+        model_config: Optional[Dict[str, Any]] = None,
+        loss_config: Optional[Dict[str, Any]] = None,
+        optimizer_config: Optional[Dict[str, Any]] = None,
+        ode_factory_config: Optional[Dict[str, Any]] = None,
+        cond_path_config: Optional[Dict[str, Any]] = None,
+        cond_vec_config: Optional[Dict[str, Any]] = None,
+        sampler_config: Optional[Dict[str, Any]] = None,
     ):
         if joint_sampler is None and (prior_sampler is None or target_sampler is None):
             raise ValueError("Provide either a joint_sampler or both prior and target samplers.")
@@ -51,12 +113,38 @@ class CFMModelBundle:
         self.joint_sampler = joint_sampler
         self.ode_factory = ode_factory
         self.device = torch.device(device)
+        self.loss_fn = loss_fn
+        self.training = True
+        self.model_config = model_config or self._infer_model_config(model)
+        if optimizer is not None:
+            self.optimizer = optimizer
+            self.optimizer_config = optimizer_config or self._infer_optimizer_config(optimizer)
+        elif optimizer_factory is not None:
+            self.optimizer = optimizer_factory(self.model)
+            self.optimizer_config = optimizer_config or self._infer_optimizer_config(self.optimizer)
+        else:
+            self.optimizer = torch.optim.Adam(self.model.parameters(), lr=1e-3)
+            self.optimizer_config = optimizer_config or self._infer_optimizer_config(self.optimizer)
+
+        self.loss_config = loss_config or self._infer_loss_config(loss_fn)
+        self.ode_factory_config = ode_factory_config or ({"name": getattr(ode_factory, "__name__", None)} if ode_factory else None)
+        self.cond_path_config = cond_path_config or _callable_to_dict(cond_path_fn)
+        self.cond_vec_config = cond_vec_config or _callable_to_dict(cond_vec_field_fn)
+        self.sampler_config = sampler_config or self._infer_sampler_config()
 
     # ------------------------------------------------------------------ #
     # Utility
     # ------------------------------------------------------------------ #
     def update_model(self, new_model: nn.Module):
         self.model = new_model
+
+    def train(self, mode: bool = True):
+        self.training = mode
+        self.model.train(mode)
+        return self
+
+    def eval(self):
+        return self.train(False)
 
     def _draw_joint(self, batch_size: int):
         if self.joint_sampler is not None:
@@ -110,9 +198,14 @@ class CFMModelBundle:
         data.update({"xt": xt, "ut": ut, "vt": vt})
         return data
 
-    def loss(self, batch_size: int, loss_fn: Callable = nn.MSELoss(), shared_data: Optional[Dict[str, torch.Tensor]] = None):
+    def loss(self, batch_size: int, shared_data: Optional[Dict[str, torch.Tensor]] = None):
         data = self.sample_batch(batch_size, shared_data=shared_data)
-        return loss_fn(data["vt"], data["ut"])
+        loss_val = self.loss_fn(data["vt"], data["ut"])
+        if self.optimizer is not None and self.training:
+            self.optimizer.zero_grad()
+            loss_val.backward()
+            self.optimizer.step()
+        return loss_val
 
     # ------------------------------------------------------------------ #
     # ODE helpers
@@ -168,3 +261,60 @@ class CFMModelBundle:
         traj = traj.transpose(0, 1) if traj.dim() == x1.dim() + 1 else traj
         end = traj[-1] if traj.shape[0] == 2 else traj[:, -1]
         return end.reshape(batch_size, -1) if flatten else end
+
+    # ------------------------------------------------------------------ #
+    # Configuration helpers
+    # ------------------------------------------------------------------ #
+    def _infer_model_config(self, model: nn.Module) -> Dict[str, Any]:
+        if hasattr(model, "to_config"):
+            return model.to_config()
+        return _class_to_dict(model, {"kwargs": {}})
+
+    def _infer_loss_config(self, loss_fn: nn.Module) -> Dict[str, Any]:
+        config = _class_to_dict(loss_fn)
+        if hasattr(loss_fn, "state_dict"):
+            config["state_dict"] = loss_fn.state_dict()
+        params = {}
+        if hasattr(loss_fn, "reduction"):
+            params["reduction"] = loss_fn.reduction
+        if params:
+            config["kwargs"] = params
+        return config
+
+    def _infer_optimizer_config(self, optimizer: torch.optim.Optimizer) -> Dict[str, Any]:
+        config = _class_to_dict(optimizer)
+        config["defaults"] = optimizer.defaults.copy()
+        group_template = []
+        for group in optimizer.param_groups:
+            group_template.append({k: v for k, v in group.items() if k != "params"})
+        config["param_groups"] = group_template
+        return config
+
+    def _infer_sampler_config(self) -> Dict[str, Any]:
+        if self.joint_sampler is not None:
+            return {"mode": "joint", "joint": _serialize_sampler(self.joint_sampler)}
+        return {
+            "mode": "independent",
+            "prior": _serialize_sampler(self.prior_sampler),
+            "target": _serialize_sampler(self.target_sampler),
+        }
+
+    def to_serializable(self) -> Dict[str, Any]:
+        data = {
+            "model": {
+                "config": self.model_config,
+                "state_dict": self.model.state_dict(),
+            },
+            "loss_fn": {
+                "config": self.loss_config,
+            },
+            "optimizer": {
+                "config": self.optimizer_config,
+                "state_dict": self.optimizer.state_dict(),
+            },
+            "cond_path_fn": self.cond_path_config,
+            "cond_vec_field_fn": self.cond_vec_config,
+            "samplers": self.sampler_config,
+            "ode_factory": self.ode_factory_config,
+        }
+        return data
