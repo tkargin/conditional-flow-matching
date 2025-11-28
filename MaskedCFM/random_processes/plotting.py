@@ -688,6 +688,11 @@ def plot_recursive_predictions(
     sample_* parameters :
         Forwarded to ``plot_time_series``; each can be a single value applied to
         all series or a list providing per-series customization.
+
+    Returns
+    -------
+    list of matplotlib.figure.Figure
+        The created figures, allowing callers to save or further customize them.
     """
     if not records:
         raise ValueError("`records` must contain at least one entry.")
@@ -697,6 +702,7 @@ def plot_recursive_predictions(
     dims = list(dims) if dims is not None else list(range(total_dims))
     steps = records if max_steps is None else records[:max_steps]
 
+    figures = []
     for rec in steps:
         pairs, labels = _prepare_sample_pairs(rec, dims, sample_plot_count)
         fig = None
@@ -842,7 +848,8 @@ def plot_recursive_predictions(
         traj = rec.get("trajectory_idx", 0)
         fig.suptitle(f"{title_prefix} {traj} – prediction step {step}")
         fig.tight_layout()
-        plt.show()
+        figures.append(fig)
+    return figures
 
 
 
