@@ -300,7 +300,8 @@ num_steps = 50000
 eval_every = 500
 prog_every = 25
 
-console = Console(force_jupyter=True)  # ensures Rich draws in notebooks
+console = Console(force_terminal=True, soft_wrap=True) # ensures Rich draws in terminals
+# console = Console(force_jupyter=True)  # ensures Rich draws in notebooks
 
 def snapshot_state_dict(state_dict):
     return {k: v.clone().cpu() if torch.is_tensor(v) else v for k, v in state_dict.items()}
